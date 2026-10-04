@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*_sand.png
+*_sand_oblique.png
+!examples/*.jpg
