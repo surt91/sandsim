@@ -18,8 +18,8 @@ from PIL import Image
 from scipy import ndimage
 
 # --- Table --------------------------------------------------------------------
-RHO_MM = 300.0      # rho = 1 corresponds to 300 mm (ball centre)
-SAND_MM = 310.0     # radius of the sand surface
+RHO_MM = 290.0      # rho = 1 corresponds to 290 mm (ball centre)
+SAND_MM = 312.0     # radius of the sand surface
 BALL_R = 5.0        # ball radius (10 mm diameter)
 
 # --- calibrated sand parameters ------------------------------------------------
@@ -28,11 +28,11 @@ P = dict(
     repose=32.0,     # angle of repose after sliding [°]
     stat=40.0,       # steepest stable slope (freshly cut walls) [°]
     smooth=0.25,     # rounding of edges [mm]
-    push_w=4.0,      # width of the deposition ring around the ball [mm]
+    push_w=2.0,      # width of the deposition ring around the ball [mm]
     side=0.6,        # share deposited sideways (instead of only in front)
-    clear_pitch=6.5, # ring pitch of the clearing pattern [mm]
+    clear_pitch=6.1, # ring pitch of the clearing pattern [mm]
     step=0.5,        # step size of the ball [mm]
-    lag=4.0,         # lag of the ball behind the magnet [mm] (rounds corners)
+    lag=6.0,         # lag of the ball behind the magnet [mm] (rounds corners)
 )
 
 
@@ -87,43 +87,59 @@ def _towed(xy, lag):
 
 
 # --- Simulation ------------------------------------------------------------------
+@njit(cache=True, inline="always")
+def _slide(h, i, j, a, b, dmax, drest, cx, cy, ball_r2, R, res):
+    """Moves sand between two neighbouring cells if the slope exceeds dmax."""
+    d = h[i, j] - h[a, b]
+    if d > dmax:
+        hi, hj, li, lj = i, j, a, b
+    elif d < -dmax:
+        hi, hj, li, lj = a, b, i, j
+        d = -d
+    else:
+        return 0.0
+    q = 0.5 * (d - drest)
+    # limit space under the ball
+    rx = lj * res - cx
+    ry = li * res - cy
+    r2 = rx * rx + ry * ry
+    if r2 < ball_r2:
+        cap = R - np.sqrt(R * R - r2) - h[li, lj]
+        if cap <= 0:
+            return 0.0
+        q = min(q, cap)
+    h[hi, hj] -= q
+    h[li, lj] += q
+    return q
+
+
 @njit(cache=True)
 def _relax(h, mask, i0, i1, j0, j1, tans, tanr, cx, cy, ball_r2, R, res, sweeps):
     """Angle of repose: slopes steeper than tans slide down to tanr (mass-conserving).
     Cells under the ball only take up sand to the ball surface."""
-    dmax = tans * res
-    drest = tanr * res
-    for _ in range(sweeps):
+    dmax, drest = tans * res, tanr * res
+    dmax2, drest2 = dmax * np.sqrt(2.0), drest * np.sqrt(2.0)
+    for sw in range(sweeps):
         moved = 0.0
-        for i in range(i0, i1):
-            for j in range(j0, j1):
+        rev = sw % 2 == 1      # alternate the sweep order, otherwise sand drifts one way
+        for ii in range(i0, i1):
+            i = i1 + i0 - 1 - ii if rev else ii
+            for jj in range(j0, j1):
+                j = j1 + j0 - 1 - jj if rev else jj
                 if not mask[i, j]:
                     continue
-                for di, dj in ((0, 1), (1, 0)):
-                    a, b = i + di, j + dj
-                    if a >= i1 or b >= j1 or not mask[a, b]:
-                        continue
-                    d = h[i, j] - h[a, b]
-                    if d > dmax:
-                        hi, hj, li, lj = i, j, a, b
-                    elif d < -dmax:
-                        hi, hj, li, lj = a, b, i, j
-                        d = -d
-                    else:
-                        continue
-                    q = 0.5 * (d - drest)
-                    # limit space under the ball
-                    rx = lj * res - cx
-                    ry = li * res - cy
-                    r2 = rx * rx + ry * ry
-                    if r2 < ball_r2:
-                        cap = R - np.sqrt(R * R - r2) - h[li, lj]
-                        if cap <= 0:
-                            continue
-                        q = min(q, cap)
-                    h[hi, hj] -= q
-                    h[li, lj] += q
-                    moved += q
+                if j + 1 < j1 and mask[i, j + 1]:
+                    moved += _slide(h, i, j, i, j + 1, dmax, drest, cx, cy, ball_r2, R, res)
+                if i + 1 < i1:
+                    if mask[i + 1, j]:
+                        moved += _slide(h, i, j, i + 1, j, dmax, drest, cx, cy, ball_r2, R, res)
+                    # diagonal neighbours too, otherwise pits and line ends come out square
+                    if j + 1 < j1 and mask[i + 1, j + 1]:
+                        moved += _slide(h, i, j, i + 1, j + 1, dmax2, drest2, cx, cy, ball_r2,
+                                        R, res)
+                    if j > j0 and mask[i + 1, j - 1]:
+                        moved += _slide(h, i, j, i + 1, j - 1, dmax2, drest2, cx, cy, ball_r2,
+                                        R, res)
         if moved < 1e-4:
             break
 
@@ -155,7 +171,7 @@ def _plow(h, mask, xs, ys, res, R, push_w, side, tans, tanr):
                     if h[i, j] > s:
                         removed += h[i, j] - s
                         h[i, j] = s
-        # 2) deposit it as a bulge in front of and beside the ball
+        # 2) deposit it as a narrow bulge in front of and beside the ball
         if removed > 0:
             wsum = 0.0
             for i in range(max(ci - rr, 0), min(ci + rr + 1, n)):
@@ -221,16 +237,14 @@ L = dict(
     ao=3.0,          # exponent of ambient occlusion in grooves
     ao_mm=15.0,      # range of ambient occlusion [mm]
     grain=0.01,      # grain (height noise) [mm]
-    albedo_noise=0.2,
+    albedo_noise=0.15,  # grain colour variation
     # tone curve: relative brightness (median = 1) -> colour, obtained by quantile matching
-    # (0.5 .. 99.5 %) against photos (top view orange, oblique view pink)
-    tone_x=(0.176, 0.234, 0.307, 0.388, 0.553, 0.853, 1.399, 2.349, 3.022, 3.606, 4.136, 9.0),
-    tone_top=((61, 25, 16), (73, 32, 22), (87, 39, 28), (101, 46, 32), (121, 55, 38),
-              (146, 69, 46), (169, 82, 55), (194, 97, 65), (215, 109, 73),
-              (233, 121, 84), (250, 136, 97), (255, 160, 125)),
-    tone_oblique=((42, 27, 27), (56, 37, 37), (75, 50, 48), (93, 60, 56), (119, 73, 64),
-                  (139, 87, 76), (160, 100, 87), (185, 116, 101), (209, 131, 112),
-                  (233, 147, 126), (249, 163, 140), (255, 190, 170)),
+    # (0.5 .. 99.95 %) against photos of the table in orange LED light (top and oblique view)
+    tone_x=(0.283, 0.328, 0.384, 0.451, 0.591, 0.931, 1.873, 2.508, 2.902, 3.170, 3.275, 3.504,
+            9.0),
+    tone=((78, 33, 16), (90, 40, 23), (106, 48, 30), (123, 57, 37), (149, 69, 46), (171, 79, 53),
+          (189, 89, 61), (209, 100, 70), (226, 109, 78), (243, 120, 85), (252, 130, 92),
+          (253, 134, 96), (255, 150, 110)),
 )
 BG = np.array([0.035, 0.025, 0.025])     # frame/surroundings
 
@@ -306,7 +320,7 @@ def _ao(H, res, ndir, smax):
     return out
 
 
-def shade(h, res, out_res, l=L, view="top", seed=2):
+def shade(h, res, out_res, l=L, seed=2):
     """Lights the height field (row 0 = top/+y). Returns colour image, height field, mask."""
     n = int(2 * SAND_MM / out_res) + 1
     c = np.arange(n) * out_res / res
@@ -328,15 +342,17 @@ def shade(h, res, out_res, l=L, view="top", seed=2):
     I /= np.percentile(I[m], 95)
     # ambient light, occluded in grooves and hollows
     I = I + l["ambient"] * _ao(H, out_res, 12, l["ao_mm"]) ** l["ao"] * nz
-    alb = 1 + l["albedo_noise"] * ndimage.gaussian_filter(rng.standard_normal((n, n)), gs)
-    I = np.clip(I * alb, 0, None)
+    I = np.clip(I, 0, None)
     I /= np.percentile(I[m], 50)
     if l.get("raw"):
         return I, H, m
-    rgb = np.array(l["tone_" + view]) / 255
+    rgb = np.array(l["tone"]) / 255
     img = np.stack([np.interp(I, l["tone_x"], rgb[:, k]) for k in range(3)], -1)
-    # darker edge towards the wall
-    img *= np.clip((SAND_MM - np.hypot(xx, yy)) / 4, 0.35, 1)[..., None]
+    # grain colour, applied after the tone curve so that shadows do not get speckled
+    alb = 1 + l["albedo_noise"] * ndimage.gaussian_filter(rng.standard_normal((n, n)), gs)
+    img *= alb[..., None]
+    # thin shadow line at the wall
+    img *= np.clip((SAND_MM - np.hypot(xx, yy)) / 1.5, 0.4, 1)[..., None]
     img[~m] = BG
     return img, H, m
 
@@ -364,8 +380,11 @@ def draw_ball_top(img, ball, out_res):
     return img
 
 
-# oblique-view camera, calibrated from a photo (Pixel phone, f ≈ 2940 px at 4080 px)
-CAM = dict(pos=(-375.7, 58.2, 250.5), target=(-114.1, 31.0), hfov=69.5, size=(2040, 1536))
+# oblique-view camera, fitted to a photo (Pixel phone, f = 2835 px at 4080 px width):
+# position [mm], point on the floor it looks at [mm], horizontal field of view [°],
+# roll around the viewing direction [°], image size [px]
+CAM = dict(pos=(-152.9, -380.0, 362.2), target=(-34.1, -82.2), hfov=71.5, roll=-1.1,
+           size=(2040, 1536))
 
 
 @njit(parallel=True, cache=True)
@@ -437,7 +456,11 @@ def oblique(tex, H, res, ball, cam=CAM):
     fw = (tg - C) / np.linalg.norm(tg - C)
     rt = np.cross(fw, [0, 0, 1.0])
     rt /= np.linalg.norm(rt)
-    Rm = np.array([rt, np.cross(fw, rt), fw])   # camera x, y (down), viewing direction
+    dn = np.cross(fw, rt)
+    a = np.radians(cam.get("roll", 0.0))
+    Rm = np.array([np.cos(a) * rt + np.sin(a) * dn,       # camera x (right),
+                   np.cos(a) * dn - np.sin(a) * rt,       # y (down),
+                   fw])                                   # viewing direction
     R0 = (H.shape[0] - 1) * res / 2
     hm = H.mean()
     bl = np.array([ball[0], ball[1], BALL_R - hm, BALL_R])
@@ -454,12 +477,12 @@ def rotate_cam(cam, deg):
 
 
 def render(thr, view="top", res=0.5, out_res=0.25, clear="auto", mirror=False,
-           cam_rot=90.0, p=P, l=L):
+           cam_rot=0.0, p=P, l=L, cam=CAM):
     t = time.time()
     h, mask, ball = simulate(read_thr(thr), res, p, clear, mirror)
-    img, H, m = shade(np.flipud(h), res, out_res, l, view)
+    img, H, m = shade(np.flipud(h), res, out_res, l)
     if view == "oblique":
-        img = oblique(img, H, out_res, ball, rotate_cam(CAM, cam_rot))
+        img = oblique(img, H, out_res, ball, rotate_cam(cam, cam_rot))
     else:
         img = draw_ball_top(img, ball, out_res)
     print(f"total: {time.time() - t:.1f} s")
@@ -481,9 +504,9 @@ def main():
     ap.add_argument("--clear", default="auto", choices=["auto", "in", "out", "none"],
                     help="clearing spiral before the pattern (auto: from outside if the pattern starts inside)")
     ap.add_argument("--mirror", action="store_true", help="mirror the theta direction")
-    ap.add_argument("--cam-rot", type=float, default=90.0,
-                    help="oblique view: rotate camera around the centre [°] (90: from below "
-                         "as in the top view, 0: as in the calibration photo)")
+    ap.add_argument("--cam-rot", type=float, default=0.0,
+                    help="oblique view: rotate camera around the centre [°] (counter-clockwise, "
+                         "0: from the lower left as in the calibration photo)")
     a = ap.parse_args()
     img = render(a.thr, a.view, a.res, a.out_res, a.clear, a.mirror, a.cam_rot)
     suffix = "_sand.png" if a.view == "top" else "_sand_oblique.png"

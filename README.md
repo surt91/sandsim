@@ -27,25 +27,29 @@ automatically. Options:
 | `--out-res` | image resolution in mm/px (default 0.25) |
 | `--clear auto\|in\|out\|none` | clearing spiral before the pattern (default: auto) |
 | `--mirror` | mirror the theta direction |
-| `--cam-rot` | rotate the oblique camera around the centre (degrees) |
+| `--cam-rot` | rotate the oblique camera around the centre (degrees, counter-clockwise; default 0 = pose of the calibration photo) |
 
-A run takes about 15 s (about half simulation, half lighting).
+A run takes about 15–20 s (about two thirds simulation, one third lighting).
 
 ## Model
 
-1. **Path** – subdivided linearly in theta/rho (this is how the table moves). The ball lags a
-   few millimetres behind the magnet and cuts corners. A clearing spiral (6.5 mm pitch) runs
-   first; its rings stay visible wherever the pattern does not pass.
+1. **Path** – subdivided linearly in theta/rho (this is how the table moves). The ball lags
+   about 6 mm behind the magnet and cuts corners; small circles shrink accordingly. A clearing
+   spiral (6.1 mm pitch) runs first; its rings stay visible wherever the pattern does not pass.
 2. **Sand** – height field at 0.5 mm/px. The 10 mm ball pushes sand, mass-conserving, into a
-   bulge in front of and beside itself; then the sand slides according to an angle-of-repose
-   model (stable up to 40°, settles at 32°). Sharp ridges, overwriting and pushed-up ridges at
-   crossings emerge on their own.
+   narrow bulge in front of and beside itself; then the sand slides according to an
+   angle-of-repose model (stable up to 40°, settles at 32°; 8 neighbours, alternating sweep
+   direction, so that it is isotropic and line ends stay round). Sharp ridges, fine hatching,
+   overwriting and pushed-up ridges at crossings emerge on their own.
 3. **Light** – point LEDs along the rim with Lambert shading and cast shadows, ambient light
-   with occlusion in grooves, sand grain; the tone curve is matched to photos. The oblique view
-   is ray-cast against the height field.
+   with occlusion in grooves, sand grain; one tone curve for both views, matched to photos (top
+   and oblique) in orange LED light. The oblique view is ray-cast against the height field; the
+   camera (`CAM`: position, target, field of view, roll) is fitted to a photo.
 
-Calibrated against photos of patterns drawn on a Dune Weaver Pro (sand diameter about 62 cm,
-10 mm ball). Table geometry and parameters are constants at the top of `sandsim.py`.
+Calibrated against photos of patterns drawn on a Dune Weaver Pro (10 mm ball). The scale was
+measured from the photos: rho = 1 corresponds to 290 mm (ball centre), the sand surface has a
+radius of 312 mm (diameter about 62 cm). Table geometry, camera and parameters are constants at
+the top of `sandsim.py`.
 
 ## Examples
 
