@@ -4,10 +4,13 @@
 //! stored per pixel; colours are composed from them with a global normalisation
 //! (95th percentile of direct light, median of total light), estimated from samples.
 
+use crate::light::{Grid, Kernel};
 use crate::params::{BG, LightParams, SAND_TINT, TONE, TONE_X};
+use crate::pool::{Pool, TileJob};
 use crate::sim::Sand;
 use crate::util::{Rect, noise_field};
 use egui::{Color32, ColorImage};
+use std::sync::atomic::{AtomicU32, Ordering};
 use web_time::Instant;
 
 pub const TILE: usize = 32;
@@ -17,6 +20,10 @@ const FINE: u8 = 0;
 const ROUGH: u8 = 1;
 const INIT: u8 = 2; // never lit
 const DIRTY: u8 = 3;
+/// tiles per job sent to a web worker
+const JOB_TILES: usize = 2;
+
+static RUNS: AtomicU32 = AtomicU32::new(0);
 
 pub struct Shader {
     pub l: LightParams,
@@ -26,15 +33,22 @@ pub struct Shader {
     tiles: usize,
     /// per tile: DIRTY, INIT, ROUGH (lit with few LEDs) or FINE
     state: Vec<u8>,
+    /// per tile: bumped whenever its lighting becomes outdated
+    generation: Vec<u32>,
+    /// per tile: being lit by a web worker
+    inflight: Vec<bool>,
+    /// identifies this simulation run towards the web workers
+    run: u32,
+    /// version of the light parameters (for the web workers)
+    version: u32,
+    /// height field region changed since the workers were last updated
+    hs_dirty: Rect,
+    grid: Grid,
+    kernel: Kernel,
     direct: Vec<f32>,
     ambient: Vec<f32>,
-    grain: Vec<f64>,
     albedo: Vec<f32>,
     samples: Vec<usize>,
-    leds_fine: Vec<[f64; 2]>,
-    leds_rough: Vec<[f64; 2]>,
-    led_steps: Vec<(f32, f32)>,
-    ao_rays: Vec<Vec<(isize, isize, f32)>>,
     lut: Vec<[f32; 3]>,
     norm: (f64, f64),
     composed_norm: (f64, f64),
@@ -45,8 +59,10 @@ pub struct Shader {
     last_full: Option<Instant>,
     /// typical sand colour, 0..1
     pub sand_rgb: [f64; 3],
-    /// tiles lit in the last frame and the time it took [ms]
+    /// tiles lit in the last frame and the time it took on the main thread [ms]
     pub stats: (usize, f64),
+    /// web workers in use
+    pub workers: usize,
 }
 
 impl Shader {
@@ -55,21 +71,23 @@ impl Shader {
         let tiles = n.div_ceil(TILE);
         let samples = (0..n * n).filter(|&p| sand.mask[p]).step_by(37).collect();
         let mut s = Self {
-            l,
+            l: l.clone(),
             n,
             res: sand.res,
             sand_mm,
             tiles,
             state: vec![INIT; tiles * tiles],
+            generation: vec![0; tiles * tiles],
+            inflight: vec![false; tiles * tiles],
+            run: RUNS.fetch_add(1, Ordering::Relaxed),
+            version: 0,
+            hs_dirty: Rect::empty(),
+            grid: Grid::new(n, sand.res, sand_mm),
+            kernel: Kernel::new(&l, sand.res),
             direct: vec![0.0; n * n],
             ambient: vec![0.0; n * n],
-            grain: Vec::new(),
             albedo: Vec::new(),
             samples,
-            leds_fine: Vec::new(),
-            leds_rough: Vec::new(),
-            led_steps: Vec::new(),
-            ao_rays: Vec::new(),
             lut: Vec::new(),
             norm: (1.0, 1.0),
             composed_norm: (0.0, 0.0),
@@ -79,6 +97,7 @@ impl Shader {
             stats: (0, 0.0),
             last_full: None,
             sand_rgb: [0.6, 0.3, 0.2],
+            workers: 0,
         };
         s.setup();
         s
@@ -88,38 +107,9 @@ impl Shader {
     fn setup(&mut self) {
         let (n, res, l) = (self.n, self.res, &self.l);
         let gs = 0.125 / res; // grain size ~0.25 mm
-        self.grain = noise_field(n, gs, 2);
         let a = noise_field(n, gs, 3);
         self.albedo = a.iter().map(|v| (1.0 + l.albedo_noise * v) as f32).collect();
-        let ring = |m: usize| -> Vec<[f64; 2]> {
-            (0..m)
-                .map(|k| {
-                    let phi = std::f64::consts::TAU * k as f64 / m as f64;
-                    [phi.cos() * l.r_led, phi.sin() * l.r_led]
-                })
-                .collect()
-        };
-        self.leds_fine = ring(l.n_led);
-        self.leds_rough = ring(l.n_led_live.min(l.n_led));
-        self.led_steps = steps(l.shadow_mm / res, 0.08)
-            .into_iter()
-            .map(|s| (s as f32, (1.0 / (s * res)) as f32))
-            .collect();
-        self.ao_rays = (0..12)
-            .map(|k| {
-                let a = std::f64::consts::TAU * (k as f64 + 0.5) / 12.0;
-                steps(l.ao_mm / res, 0.1)
-                    .into_iter()
-                    .map(|s| {
-                        (
-                            (a.sin() * s).round() as isize,
-                            (a.cos() * s).round() as isize,
-                            (1.0 / (s * res)) as f32,
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+        self.kernel = Kernel::new(l, res);
         let tone: Vec<[f64; 3]> = match l.led_color {
             None => TONE.to_vec(),
             Some(led) => {
@@ -160,6 +150,7 @@ impl Shader {
         } == self.l;
         self.l = l;
         self.setup();
+        self.version += 1;
         if colour_only {
             self.composed_norm = (0.0, 0.0); // forces a full re-colouring
             self.last_full = None;
@@ -171,6 +162,7 @@ impl Shader {
 
     pub fn mark_all(&mut self) {
         self.state.iter_mut().for_each(|d| *d = DIRTY);
+        self.generation.iter_mut().for_each(|g| *g += 1);
     }
 
     /// Marks the region whose lighting depends on a height change in `r`: the changed
@@ -179,12 +171,16 @@ impl Shader {
         if r.is_empty() {
             return;
         }
-        let m = (self.l.shadow_mm.max(self.l.ao_mm) / self.res) as usize + 2;
+        self.hs_dirty.union(r);
+        let m = self.kernel.reach(self.res);
         for (r, level) in [(r.grow(m, self.n), ROUGH), (r.grow(2, self.n), DIRTY)] {
             for ti in r.i0 / TILE..=(r.i1 - 1) / TILE {
                 for tj in r.j0 / TILE..=(r.j1 - 1) / TILE {
-                    let s = &mut self.state[ti * self.tiles + tj];
-                    *s = (*s).max(level);
+                    let t = ti * self.tiles + tj;
+                    self.state[t] = self.state[t].max(level);
+                    if level == ROUGH {
+                        self.generation[t] += 1; // once per tile and mark
+                    }
                 }
             }
         }
@@ -209,10 +205,18 @@ impl Shader {
         self.state.len()
     }
 
-    /// Lights dirty tiles (closest to `focus` first) until `budget_ms` is used up.
+    /// Lights dirty tiles (closest to `focus` first): on the web workers if there are any,
+    /// otherwise on the main thread until `budget_ms` is used up.
     /// While `live`, they are lit quickly with few LEDs; spare time and idle frames
     /// refine them with the full LED strip.
-    pub fn work(&mut self, sand: &Sand, focus: [f64; 2], budget_ms: f64, live: bool) {
+    pub fn work(
+        &mut self,
+        sand: &Sand,
+        focus: [f64; 2],
+        budget_ms: f64,
+        live: bool,
+        pool: Option<&mut Pool>,
+    ) {
         let t0 = Instant::now();
         let (fi, fj) = (focus[1] / self.res / TILE as f64, focus[0] / self.res / TILE as f64);
         let dist = |t: usize| {
@@ -221,28 +225,84 @@ impl Shader {
         };
         // changed tiles first, then never lit ones, both closest to the ball first
         let mut todo: Vec<usize> =
-            (0..self.state.len()).filter(|&t| self.state[t] >= INIT).collect();
+            (0..self.state.len()).filter(|&t| self.state[t] >= INIT && !self.inflight[t]).collect();
         todo.sort_by(|&a, &b| self.state[b].cmp(&self.state[a]).then(dist(a).total_cmp(&dist(b))));
-        let mut refine: Vec<usize> =
-            (0..self.state.len()).filter(|&t| self.state[t] == ROUGH).collect();
+        let mut refine: Vec<usize> = (0..self.state.len())
+            .filter(|&t| self.state[t] == ROUGH && !self.inflight[t])
+            .collect();
         // while drawing, refine far from the ball first (near it, tiles get dirty again soon)
         refine.sort_by(|&a, &b| {
             if live { dist(b).total_cmp(&dist(a)) } else { dist(a).total_cmp(&dist(b)) }
         });
+        let mut order =
+            todo.into_iter().map(|t| (t, !live)).chain(refine.into_iter().map(|t| (t, true)));
         let mut done = Vec::new();
         self.stats = (0, 0.0);
-        for (t, fine) in
-            todo.into_iter().map(|t| (t, !live)).chain(refine.into_iter().map(|t| (t, true)))
-        {
-            if t0.elapsed().as_secs_f64() * 1e3 > budget_ms {
-                break;
+        match pool {
+            Some(pool) => {
+                self.workers = pool.size();
+                self.sync(pool, sand);
+                for r in pool.take() {
+                    if r.run != self.run {
+                        continue;
+                    }
+                    let t = r.tile;
+                    self.inflight[t] = false;
+                    let w = r.rect.j1 - r.rect.j0;
+                    for i in r.rect.i0..r.rect.i1 {
+                        let (p, q) = (i * self.n + r.rect.j0, (i - r.rect.i0) * w);
+                        self.direct[p..p + w].copy_from_slice(&r.direct[q..q + w]);
+                        self.ambient[p..p + w].copy_from_slice(&r.ambient[q..q + w]);
+                    }
+                    // a result for an outdated tile is still shown, but the tile stays due
+                    if r.generation == self.generation[t] {
+                        self.state[t] = if r.fine { FINE } else { ROUGH };
+                    }
+                    self.stats.0 += 1;
+                    done.push(t);
+                }
+                for k in pool.free() {
+                    let jobs: Vec<TileJob> = order
+                        .by_ref()
+                        .take(JOB_TILES)
+                        .map(|(t, fine)| {
+                            self.inflight[t] = true;
+                            TileJob {
+                                tile: t,
+                                rect: self.tile_rect(t),
+                                fine,
+                                generation: self.generation[t],
+                            }
+                        })
+                        .collect();
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    pool.send(k, self.run, &jobs);
+                }
             }
-            self.state[t] = if fine { FINE } else { ROUGH };
-            let t1 = Instant::now();
-            self.light_tile(sand, t, fine);
-            self.stats.0 += 1;
-            self.stats.1 += t1.elapsed().as_secs_f64() * 1e3;
-            done.push(t);
+            None => {
+                let mut direct = vec![0.0; TILE * TILE];
+                let mut ambient = vec![0.0; TILE * TILE];
+                for (t, fine) in order {
+                    if t0.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        break;
+                    }
+                    self.state[t] = if fine { FINE } else { ROUGH };
+                    let t1 = Instant::now();
+                    let r = self.tile_rect(t);
+                    let w = r.j1 - r.j0;
+                    self.kernel.light(&self.grid, &sand.hs, r, fine, &mut direct, &mut ambient);
+                    for i in r.i0..r.i1 {
+                        let (p, q) = (i * self.n + r.j0, (i - r.i0) * w);
+                        self.direct[p..p + w].copy_from_slice(&direct[q..q + w]);
+                        self.ambient[p..p + w].copy_from_slice(&ambient[q..q + w]);
+                    }
+                    self.stats.0 += 1;
+                    self.stats.1 += t1.elapsed().as_secs_f64() * 1e3;
+                    done.push(t);
+                }
+            }
         }
         if done.is_empty() && !self.full_change {
             return;
@@ -268,6 +328,22 @@ impl Shader {
         }
     }
 
+    /// Brings the workers up to date: run, light parameters, height field.
+    fn sync(&mut self, pool: &mut Pool, sand: &Sand) {
+        let (run, version) = pool.synced();
+        if run != self.run {
+            let (n, res, mm) = (self.n, self.res, self.sand_mm);
+            pool.start_run(self.run, self.version, n, res, mm, &sand.hs, &self.l);
+            self.hs_dirty = Rect::empty();
+        } else if version != self.version {
+            pool.set_params(self.version, &self.l);
+        }
+        if !self.hs_dirty.is_empty() {
+            pool.update(self.hs_dirty, &sand.hs, self.n);
+            self.hs_dirty = Rect::empty();
+        }
+    }
+
     pub fn tile_rect(&self, t: usize) -> Rect {
         let (ti, tj) = (t / self.tiles, t % self.tiles);
         Rect {
@@ -275,118 +351,6 @@ impl Shader {
             i1: ((ti + 1) * TILE).min(self.n),
             j0: tj * TILE,
             j1: ((tj + 1) * TILE).min(self.n),
-        }
-    }
-
-    fn light_tile(&mut self, sand: &Sand, t: usize, fine: bool) {
-        let r = self.tile_rect(t);
-        let (n, res, l) = (self.n, self.res, &self.l);
-        let g2 = 2.0 * l.grain;
-        let hg = |i: usize, j: usize| sand.hs[i * n + j] as f64 + g2 * self.grain[i * n + j];
-        let r0 = self.sand_mm;
-        let a0 = l.alpha0.to_radians();
-        let soft = l.soft.to_radians();
-        let ts = (0.5 * soft).tan();
-        let nf = n as f32;
-        let hs = &sand.hs[..];
-        let leds = if fine { &self.leds_fine } else { &self.leds_rough };
-        // highest sand within reach of the tile: once even that can't change the result,
-        // the horizon search along a ray stops early
-        let reach = r.grow((l.shadow_mm.max(l.ao_mm) / res) as usize + 2, n);
-        let mut hmax = f32::MIN;
-        for i in reach.i0..reach.i1 {
-            hmax = hs[i * n + reach.j0..i * n + reach.j1].iter().fold(hmax, |a, &b| a.max(b));
-        }
-        let wl = 48.0 / leds.len() as f64;
-        for i in r.i0..r.i1 {
-            let y = r0 - i as f64 * res;
-            for j in r.j0..r.j1 {
-                let p = i * n + j;
-                if !sand.mask[p] {
-                    continue;
-                }
-                let x = j as f64 * res - r0;
-                // normal from the grainy height field (grain only in the normals, not in shadows)
-                let (ja, jb) = (j.saturating_sub(1), (j + 1).min(n - 1));
-                let (ia, ib) = (i.saturating_sub(1), (i + 1).min(n - 1));
-                let gx = (hg(i, jb) - hg(i, ja)) / ((jb - ja) as f64 * res);
-                let gy = (hg(ib, j) - hg(ia, j)) / ((ib - ia) as f64 * res);
-                let nz = 1.0 / (1.0 + gx * gx + gy * gy).sqrt();
-                let (nx, ny) = (-gx * nz, gy * nz); // rows run towards -y
-                let h32 = hs[p];
-                let h = h32 as f64;
-                // direct light from the LED strip with cast shadows (horizon search)
-                let mut acc = 0.0;
-                for led in leds {
-                    let (mut lx, mut ly) = (led[0] - x, led[1] - y);
-                    let d = (lx * lx + ly * ly).sqrt();
-                    let dz = l.z_led - h;
-                    lx /= d;
-                    ly /= d;
-                    let q = dz / d;
-                    let c = (nx * lx + ny * ly + nz * q) / (1.0 + q * q).sqrt();
-                    if c <= 0.0 {
-                        continue;
-                    }
-                    let el = q.atan();
-                    let em = (-(el / a0).powi(2) - l.falloff * d.ln()).exp();
-                    // fully lit below t_lo, fully shadowed above t_hi (tangents of el ∓ soft/2)
-                    let t_lo = (q - ts) / (1.0 + q * ts);
-                    let t_hi = if q * ts < 1.0 { (q + ts) / (1.0 - q * ts) } else { f64::MAX };
-                    let (t_hi32, lx32, ly32) = (t_hi as f32, lx as f32, ly as f32);
-                    let (fi, fj) = (i as f32 + 0.5, j as f32 + 0.5);
-                    let mut tmax = -1.0f32;
-                    let mut floor = t_lo as f32; // below this, the LED is fully visible
-                    let above = hmax - h32;
-                    for &(s, inv) in &self.led_steps {
-                        if above * inv <= floor {
-                            break;
-                        }
-                        let ii = (fi - ly32 * s).floor();
-                        let jj = (fj + lx32 * s).floor();
-                        if ii < 0.0 || jj < 0.0 || ii >= nf || jj >= nf {
-                            break;
-                        }
-                        let tt = (hs[ii as usize * n + jj as usize] - h32) * inv;
-                        if tt > tmax {
-                            tmax = tt;
-                            floor = floor.max(tmax);
-                            if tmax >= t_hi32 {
-                                break;
-                            }
-                        }
-                    }
-                    let tmax = tmax as f64;
-                    let vis = if tmax >= t_hi {
-                        continue;
-                    } else if tmax <= t_lo {
-                        1.0
-                    } else {
-                        ((el - tmax.atan()) / soft + 0.5).clamp(0.0, 1.0)
-                    };
-                    acc += c * em * vis;
-                }
-                self.direct[p] = (acc * wl) as f32;
-                // sky visibility (cosine-weighted) from horizon angles in 12 directions
-                let mut v = 0.0;
-                for ray in &self.ao_rays {
-                    let mut tmax = 0.0f32;
-                    for &(di, dj, inv) in ray {
-                        if (hmax - h32) * inv <= tmax {
-                            break;
-                        }
-                        let (ii, jj) = (i as isize + di, j as isize + dj);
-                        if ii < 0 || jj < 0 || ii >= n as isize || jj >= n as isize {
-                            break;
-                        }
-                        tmax = tmax.max((hs[ii as usize * n + jj as usize] - h32) * inv);
-                    }
-                    let tmax = tmax as f64;
-                    v += 1.0 / (1.0 + tmax * tmax); // cos²(horizon angle)
-                }
-                v /= self.ao_rays.len() as f64;
-                self.ambient[p] = (l.ambient * v.powf(l.ao) * nz) as f32;
-            }
         }
     }
 
@@ -449,17 +413,6 @@ impl Shader {
         }
         out
     }
-}
-
-/// Geometrically growing march distances 1, 2+g, … below `max` (in pixels).
-fn steps(max: f64, g: f64) -> Vec<f64> {
-    let mut v = Vec::new();
-    let mut s = 1.0;
-    while s < max {
-        v.push(s);
-        s += 1.0 + s * g;
-    }
-    v
 }
 
 fn interp(x: f64, xs: &[f64], ys: &[[f64; 3]], ch: usize) -> f64 {

@@ -1,13 +1,8 @@
-//! sandsim-rs: live simulation of a kinetic sand table, as a web app (egui/wasm).
+//! sandsim: live simulation of a kinetic sand table, as a web app (egui/wasm).
 
-mod app;
-mod oblique;
-mod params;
-mod path;
-mod png;
-mod shade;
-mod sim;
-mod util;
+use sandsim::app;
+#[cfg(not(target_arch = "wasm32"))]
+use sandsim::{oblique, params, path, png, shade, sim};
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
@@ -50,7 +45,7 @@ fn bench(thr: &str) {
         lp.n_led = v.parse().unwrap();
     }
     let mut sh = shade::Shader::new(&sand, p.sand_mm, lp);
-    sh.work(&sand, sand.ball(), 1e9, false);
+    sh.work(&sand, sand.ball(), 1e9, false, None);
     println!("lighting: {:.2} s", t.elapsed().as_secs_f64());
     let out = std::path::Path::new(thr).with_extension("").to_string_lossy().into_owned();
     std::fs::write(format!("{out}_rs.png"), png::encode(&sh.image)).unwrap();

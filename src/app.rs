@@ -3,6 +3,7 @@
 use crate::oblique::Oblique;
 use crate::params::{Camera, Clear, LightParams, SimParams};
 use crate::path::{ball_path, parse_thr};
+use crate::pool::Pool;
 use crate::shade::Shader;
 use crate::sim::Sand;
 use egui::{Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Vec2};
@@ -42,6 +43,8 @@ pub struct SandApp {
     light_version: u64,
     cam: Camera,
     run: Option<Run>,
+    /// web workers for the lighting (web only)
+    pool: Option<Pool>,
     playing: bool,
     speed: f64, // ball speed [mm/s]
     max_speed: bool,
@@ -59,7 +62,7 @@ pub struct SandApp {
 }
 
 impl SandApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, file: Option<(String, Vec<u8>)>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, file: Option<(String, Vec<u8>)>) -> Self {
         let mut app = Self {
             name: String::new(),
             thr: Vec::new(),
@@ -69,6 +72,13 @@ impl SandApp {
             light_version: 0,
             cam: Camera::default(),
             run: None,
+            #[cfg(target_arch = "wasm32")]
+            pool: Pool::new(&cc.egui_ctx),
+            #[cfg(not(target_arch = "wasm32"))]
+            pool: {
+                let _ = cc;
+                None
+            },
             playing: true,
             speed: 3000.0,
             max_speed: false,
@@ -169,7 +179,8 @@ impl SandApp {
                 want = want.min(k.saturating_sub(run.sand.k));
             }
             // the animation waits for the lighting, so that it shows what is drawn
-            let max_dirty = if self.skip_to.is_some() { usize::MAX } else { 8 };
+            let workers = self.pool.as_ref().map_or(0, |p| p.size());
+            let max_dirty = if self.skip_to.is_some() { usize::MAX } else { 8 + 2 * workers };
             while want > 0
                 && t0.elapsed().as_secs_f64() * 1e3 < budget
                 && run.shader.dirty() < max_dirty
@@ -192,7 +203,7 @@ impl SandApp {
         }
         let budget = if self.skip_to.is_some() { 4.0 } else { (34.0 - self.sim_ms).max(8.0) };
         let live = !run.sand.done() && (self.playing || self.skip_to.is_some());
-        run.shader.work(&run.sand, run.sand.ball(), budget, live);
+        run.shader.work(&run.sand, run.sand.ball(), budget, live, self.pool.as_mut());
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
@@ -642,8 +653,12 @@ impl eframe::App for SandApp {
         self.oblique(&ctx);
         if let Some(run) = &self.run {
             let (lt, lms) = run.shader.stats;
+            let light = match run.shader.workers {
+                0 => format!("light {lt} tiles in {lms:.0} ms"),
+                w => format!("light {lt} tiles from {w} workers"),
+            };
             self.status = format!(
-                "{:.0} mm/s · grid {n}×{n} · sim {} steps in {:.0} ms · light {lt} tiles in {lms:.0} ms · frame {:.0} ms",
+                "{:.0} mm/s · grid {n}×{n} · sim {} steps in {:.0} ms · {light} · frame {:.0} ms",
                 self.actual_speed,
                 self.sim_steps,
                 self.sim_ms,

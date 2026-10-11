@@ -16,7 +16,7 @@ env_logger = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "HtmlInputElement", "FileList", "File", "CssStyleDeclaration"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "HtmlInputElement", "FileList", "File", "CssStyleDeclaration", "Worker", "MessageEvent", "DedicatedWorkerGlobalScope", "Navigator"] }
 js-sys = "0.3"
 
 [profile.release]

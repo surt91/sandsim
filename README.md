@@ -43,7 +43,11 @@ brightness curve and tint the sand (`SAND_TINT`) with the chosen colour – an a
 
 ## How it stays interactive
 
-The browser gives the app a single thread, so all work is split into time slices per frame:
+The simulation runs on the main thread in time slices per frame; the lighting is spread over
+web workers (one per spare core, up to 8), which works on any static host such as GitHub Pages:
+each worker keeps a copy of the height field, gets the changed regions and lists of tiles to
+light, and sends back their light values. Without workers (single core, native window) the
+lighting also runs in time slices on the main thread.
 
 - The simulation advances the ball in chunks of 16 steps and reports the changed region.
 - Lighting works on 32×32 px tiles. Tiles touched by the ball are re-lit first, closest to the
@@ -53,6 +57,9 @@ The browser gives the app a single thread, so all work is split into time slices
   median of total light) is estimated from a fixed sample of pixels; the whole image is
   re-coloured with it at most once a second while work is pending. Exposure and colour
   settings only re-colour, they don't re-light.
+- Every tile has a generation counter that is bumped when the sand around it changes; a worker
+  result for an outdated generation is shown, but the tile stays due. The animation waits while
+  too many changed tiles are not lit yet, so the sand never shows where the ball has been.
 - The horizon searches stop as soon as even the highest sand within reach could not change
   the result.
 
