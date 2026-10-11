@@ -1,5 +1,10 @@
+# Rust / trunk
+/target
+/dist
+
+# Python prototype
 __pycache__/
 *.pyc
 *_sand.png
 *_sand_oblique.png
-!examples/*.jpg
+!prototype/examples/*.jpg
