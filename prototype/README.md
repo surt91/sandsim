@@ -1,5 +1,8 @@
 # sandsim – photorealistic previews for sand table patterns
 
+*This is the Python prototype the [web app](../README.md) was ported from. It renders
+single images from the command line and is kept as the reference for the model.*
+
 `sandsim.py` simulates how a steel ball draws a theta-rho pattern (`.thr`, as used by
 Dune Weaver, Sisyphus and Sandify) into sand, and renders the result with grazing light like
 an LED strip around the rim. This lets you iterate on patterns without running the table.
@@ -59,7 +62,7 @@ the top of `sandsim.py`.
 
 ## License
 
-The code is MIT licensed, see [LICENSE](LICENSE).
+The code is MIT licensed, see [LICENSE](../LICENSE).
 
 Third-party content in `examples/`:
 
