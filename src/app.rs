@@ -17,6 +17,11 @@ const EXAMPLES: &[(&str, &str)] = &[
     ("Sunflower", include_str!("../assets/sonnenblume.thr")),
 ];
 
+/// Changed tiles per wave of lighting work.
+pub fn max_dirty(workers: usize) -> usize {
+    8 + 4 * workers
+}
+
 /// file name and contents
 type NamedFile = (String, Vec<u8>);
 
@@ -31,6 +36,9 @@ struct Run {
     shader: Shader,
     params: SimParams,
     tex: Option<TextureHandle>,
+    /// ball position of the latest height field sent to the lighting, and of the shown one
+    lit_ball: [f64; 2],
+    shown_ball: [f64; 2],
     oblique: Option<(Oblique, TextureHandle, (usize, u64, Camera))>,
 }
 
@@ -43,7 +51,7 @@ pub struct SandApp {
     light_version: u64,
     cam: Camera,
     run: Option<Run>,
-    /// web workers for the lighting (web only)
+    /// web workers / threads for the lighting
     pool: Option<Pool>,
     playing: bool,
     speed: f64, // ball speed [mm/s]
@@ -72,13 +80,7 @@ impl SandApp {
             light_version: 0,
             cam: Camera::default(),
             run: None,
-            #[cfg(target_arch = "wasm32")]
             pool: Pool::new(&cc.egui_ctx),
-            #[cfg(not(target_arch = "wasm32"))]
-            pool: {
-                let _ = cc;
-                None
-            },
             playing: true,
             speed: 3000.0,
             max_speed: false,
@@ -116,7 +118,16 @@ impl SandApp {
         let (path, n_clear) = ball_path(&self.thr, &self.sim);
         let sand = Sand::new(&self.sim, path, n_clear);
         let shader = Shader::new(&sand, self.sim.sand_mm, self.light.clone());
-        self.run = Some(Run { sand, shader, params: self.sim.clone(), tex: None, oblique: None });
+        let ball = sand.ball();
+        self.run = Some(Run {
+            sand,
+            shader,
+            params: self.sim.clone(),
+            tex: None,
+            lit_ball: ball,
+            shown_ball: ball,
+            oblique: None,
+        });
         self.skip_to = None;
         self.step_acc = 0.0;
         self.playing = true;
@@ -156,6 +167,11 @@ impl SandApp {
     /// Simulation and lighting for this frame, within a time budget.
     fn step(&mut self, dt: f64) {
         let Some(run) = &mut self.run else { return };
+        // the ball is drawn where it was when the shown sand was lit
+        run.shader.receive(self.pool.as_mut());
+        if run.shader.dirty() == 0 {
+            run.shown_ball = run.lit_ball;
+        }
         let t0 = Instant::now();
         let step_mm = run.params.step;
         if let Some(k) = self.skip_to
@@ -178,10 +194,16 @@ impl SandApp {
             if let Some(k) = self.skip_to {
                 want = want.min(k.saturating_sub(run.sand.k));
             }
-            // the animation waits for the lighting, so that it shows what is drawn
+            // the animation waits for the lighting, so that it shows what is drawn: the ball
+            // moves on once all changed tiles are lit, and only until enough have changed
+            // for one wave of work for the lighting
             let workers = self.pool.as_ref().map_or(0, |p| p.size());
-            let max_dirty = if self.skip_to.is_some() { usize::MAX } else { 8 + 2 * workers };
-            while want > 0
+            let (max_dirty, wait) = match self.skip_to {
+                Some(_) => (usize::MAX, false),
+                None => (max_dirty(workers), run.shader.dirty() > 0),
+            };
+            while !wait
+                && want > 0
                 && t0.elapsed().as_secs_f64() * 1e3 < budget
                 && run.shader.dirty() < max_dirty
             {
@@ -204,6 +226,12 @@ impl SandApp {
         let budget = if self.skip_to.is_some() { 4.0 } else { (34.0 - self.sim_ms).max(8.0) };
         let live = !run.sand.done() && (self.playing || self.skip_to.is_some());
         run.shader.work(&run.sand, run.sand.ball(), budget, live, self.pool.as_mut());
+        if run.sand.k != k0 {
+            run.lit_ball = run.sand.ball();
+        }
+        if run.shader.dirty() == 0 {
+            run.shown_ball = run.lit_ball;
+        }
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
@@ -599,7 +627,7 @@ impl SandApp {
         }
         // the steel ball
         let n = run.sand.n as f32;
-        let [bx, by] = run.sand.ball();
+        let [bx, by] = run.shown_ball;
         let res = run.params.res as f32;
         let c = r.min + Vec2::new(bx as f32 / res + 0.5, by as f32 / res + 0.5) / n * side;
         let br = run.params.ball_r as f32 / res / n * side;

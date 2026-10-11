@@ -1,21 +1,15 @@
 //! The web worker side of [`crate::pool`]: lights tiles on request.
 
-use crate::light::{Grid, Kernel, decode};
+use crate::light::decode;
+use crate::pool::{TileJob, WorkerState};
 use crate::util::Rect;
 use eframe::wasm_bindgen::{JsCast, closure::Closure};
 use js_sys::{Array, Float32Array, Float64Array, Uint32Array};
 use std::cell::RefCell;
 use web_sys::DedicatedWorkerGlobalScope;
 
-struct State {
-    run: u32,
-    grid: Grid,
-    kernel: Kernel,
-    hs: Vec<f32>,
-}
-
 thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    static STATE: RefCell<Option<WorkerState>> = const { RefCell::new(None) };
 }
 
 /// Entry point of the worker binary.
@@ -35,55 +29,55 @@ fn num(msg: &Array, k: u32) -> f64 {
     msg.get(k).as_f64().unwrap_or(0.0)
 }
 
-fn handle(msg: &Array, state: &mut Option<State>) {
+fn handle(msg: &Array, state: &mut Option<WorkerState>) {
     match msg.get(0).as_string().as_deref() {
         Some("init") => {
-            let (n, res, sand_mm) = (num(msg, 2) as usize, num(msg, 3), num(msg, 4));
+            let (run, n, res, sand_mm) =
+                (num(msg, 1) as u32, num(msg, 2) as usize, num(msg, 3), num(msg, 4));
             let l = decode(&Float64Array::from(msg.get(5)).to_vec());
-            *state = Some(State {
-                run: num(msg, 1) as u32,
-                grid: Grid::new(n, res, sand_mm),
-                kernel: Kernel::new(&l, res),
-                hs: Float32Array::from(msg.get(6)).to_vec(),
-            });
+            let hs = Float32Array::from(msg.get(6)).to_vec();
+            *state = Some(WorkerState::new(run, n, res, sand_mm, &l, hs));
         }
         Some("params") => {
             if let Some(s) = state {
-                let l = decode(&Float64Array::from(msg.get(1)).to_vec());
-                s.kernel = Kernel::new(&l, s.grid.res);
+                s.set_params(&decode(&Float64Array::from(msg.get(1)).to_vec()));
             }
         }
         Some("hs") => {
             if let Some(s) = state {
                 let [i0, i1, j0, j1] = [1, 2, 3, 4].map(|k| num(msg, k) as usize);
-                let rows = Float32Array::from(msg.get(5)).to_vec();
-                let (n, w) = (s.grid.n, j1 - j0);
-                for i in i0..i1 {
-                    s.hs[i * n + j0..i * n + j1].copy_from_slice(&rows[(i - i0) * w..][..w]);
-                }
+                s.update(Rect { i0, i1, j0, j1 }, &Float32Array::from(msg.get(5)).to_vec());
             }
         }
         Some("job") => {
             let run = num(msg, 1) as u32;
-            let mut meta = Uint32Array::from(msg.get(2)).to_vec();
-            // always answer, the main thread counts outstanding jobs
-            let Some(s) = state.as_ref().filter(|s| s.run == run) else {
-                meta.clear();
-                return reply(run, &meta, &[]);
-            };
+            let meta = Uint32Array::from(msg.get(2)).to_vec();
+            let jobs: Vec<TileJob> = meta
+                .as_chunks::<7>()
+                .0
+                .iter()
+                .map(|m| TileJob {
+                    tile: m[0] as usize,
+                    rect: Rect {
+                        i0: m[1] as usize,
+                        i1: m[2] as usize,
+                        j0: m[3] as usize,
+                        j1: m[4] as usize,
+                    },
+                    fine: m[5] != 0,
+                    generation: m[6],
+                })
+                .collect();
+            // always answer (possibly empty), the main thread counts outstanding jobs
+            let results = state.as_ref().map_or(Vec::new(), |s| s.job(run, &jobs));
+            let mut meta = Vec::new();
             let mut data = Vec::new();
-            for m in meta.as_chunks::<7>().0 {
-                let r = Rect {
-                    i0: m[1] as usize,
-                    i1: m[2] as usize,
-                    j0: m[3] as usize,
-                    j1: m[4] as usize,
-                };
-                let len = (r.i1 - r.i0) * (r.j1 - r.j0);
-                let (mut direct, mut ambient) = (vec![0.0; len], vec![0.0; len]);
-                s.kernel.light(&s.grid, &s.hs, r, m[5] != 0, &mut direct, &mut ambient);
-                data.extend(direct);
-                data.extend(ambient);
+            for r in results {
+                let q = r.rect;
+                meta.extend([r.tile, q.i0, q.i1, q.j0, q.j1, r.fine as usize].map(|v| v as u32));
+                meta.push(r.generation);
+                data.extend(r.direct);
+                data.extend(r.ambient);
             }
             reply(run, &meta, &data);
         }

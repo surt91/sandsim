@@ -1,10 +1,11 @@
-//! Web workers that light tiles in parallel.
+//! Workers that light tiles in parallel: web workers in the browser, threads natively.
+//! Both run the same [`WorkerState`], only the transport differs (postMessage / channels).
 //!
 //! Every worker keeps its own copy of the height field. The main thread sends it the
 //! regions that changed and jobs (lists of tiles); messages to a worker are processed in
 //! order, so a job always sees the height field as it was when the job was sent.
 //!
-//! Messages (JS arrays) to a worker:
+//! Messages (JS arrays) to a web worker:
 //!   ["init", run, n, res, sand_mm, Float64Array params, Float32Array hs]
 //!   ["params", Float64Array params]
 //!   ["hs", i0, i1, j0, j1, Float32Array rows]
@@ -13,8 +14,11 @@
 //!   ["ready"]
 //!   ["res", run, Uint32Array (as in the job), Float32Array [direct, ambient] per tile]
 
+use crate::light::{Grid, Kernel};
+use crate::params::LightParams;
 use crate::util::Rect;
 
+#[derive(Clone, Copy)]
 pub struct TileJob {
     pub tile: usize,
     pub rect: Rect,
@@ -35,6 +39,66 @@ pub struct TileResult {
 /// Jobs a worker may have queued at once (more would make the priorities stale).
 pub const MAX_OUTSTANDING: usize = 2;
 
+/// One worker per spare core, at most 8; None below two workers.
+/// Natively, the environment variable SANDSIM_WORKERS overrides this (0: main thread only).
+fn worker_count(cores: usize) -> Option<usize> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(n) = std::env::var("SANDSIM_WORKERS").ok().and_then(|v| v.parse().ok()) {
+        return (n > 0).then_some(n);
+    }
+    let n = cores.saturating_sub(1).min(8);
+    (n >= 2).then_some(n)
+}
+
+/// What a worker knows: the height field of the current run and the lighting kernel.
+pub struct WorkerState {
+    run: u32,
+    grid: Grid,
+    kernel: Kernel,
+    hs: Vec<f32>,
+}
+
+impl WorkerState {
+    pub fn new(run: u32, n: usize, res: f64, sand_mm: f64, l: &LightParams, hs: Vec<f32>) -> Self {
+        Self { run, grid: Grid::new(n, res, sand_mm), kernel: Kernel::new(l, res), hs }
+    }
+
+    pub fn set_params(&mut self, l: &LightParams) {
+        self.kernel = Kernel::new(l, self.grid.res);
+    }
+
+    /// Copies a changed region (rows of r) into the height field.
+    pub fn update(&mut self, r: Rect, rows: &[f32]) {
+        let (n, w) = (self.grid.n, r.j1 - r.j0);
+        for i in r.i0..r.i1 {
+            self.hs[i * n + r.j0..i * n + r.j1].copy_from_slice(&rows[(i - r.i0) * w..][..w]);
+        }
+    }
+
+    /// Lights the tiles of a job; nothing if it belongs to another run.
+    pub fn job(&self, run: u32, jobs: &[TileJob]) -> Vec<TileResult> {
+        if run != self.run {
+            return Vec::new();
+        }
+        jobs.iter()
+            .map(|j| {
+                let len = (j.rect.i1 - j.rect.i0) * (j.rect.j1 - j.rect.j0);
+                let (mut direct, mut ambient) = (vec![0.0; len], vec![0.0; len]);
+                self.kernel.light(&self.grid, &self.hs, j.rect, j.fine, &mut direct, &mut ambient);
+                TileResult {
+                    run,
+                    tile: j.tile,
+                    rect: j.rect,
+                    fine: j.fine,
+                    generation: j.generation,
+                    direct,
+                    ambient,
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub use imp::Pool;
 
@@ -43,47 +107,153 @@ pub use native::Pool;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{TileJob, TileResult};
+    use super::{MAX_OUTSTANDING, TileJob, TileResult, WorkerState, worker_count};
     use crate::params::LightParams;
     use crate::util::Rect;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
 
-    /// Natively everything is lit on the main thread.
-    pub struct Pool;
+    enum Msg {
+        Init { run: u32, n: usize, res: f64, sand_mm: f64, l: LightParams, hs: Vec<f32> },
+        Params(LightParams),
+        Hs(Rect, Vec<f32>),
+        Job(u32, Vec<TileJob>),
+    }
+
+    struct Worker {
+        tx: Sender<Msg>,
+        outstanding: Arc<AtomicUsize>,
+    }
+
+    /// Threads that behave like the web workers.
+    pub struct Pool {
+        workers: Vec<Worker>,
+        results: Receiver<Vec<TileResult>>,
+        synced: (u32, u32),
+    }
 
     impl Pool {
+        /// Starts one thread per spare core; None if that isn't worth it.
+        pub fn new(ctx: &egui::Context) -> Option<Self> {
+            Self::spawn(Some(ctx.clone()))
+        }
+
+        /// Without a UI to wake up (benchmarks).
+        pub fn spawn(ctx: Option<egui::Context>) -> Option<Self> {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let count = worker_count(cores)?;
+            let (res_tx, results) = channel();
+            let workers = (0..count)
+                .map(|k| {
+                    let (tx, rx) = channel::<Msg>();
+                    let outstanding = Arc::new(AtomicUsize::new(0));
+                    let (out, res_tx, ctx) = (outstanding.clone(), res_tx.clone(), ctx.clone());
+                    std::thread::Builder::new()
+                        .name(format!("light-{k}"))
+                        .spawn(move || {
+                            let mut state: Option<WorkerState> = None;
+                            for msg in rx {
+                                match msg {
+                                    Msg::Init { run, n, res, sand_mm, l, hs } => {
+                                        state =
+                                            Some(WorkerState::new(run, n, res, sand_mm, &l, hs));
+                                    }
+                                    Msg::Params(l) => {
+                                        state.iter_mut().for_each(|s| s.set_params(&l))
+                                    }
+                                    Msg::Hs(r, rows) => {
+                                        state.iter_mut().for_each(|s| s.update(r, &rows))
+                                    }
+                                    Msg::Job(run, jobs) => {
+                                        let r = state
+                                            .as_ref()
+                                            .map_or(Vec::new(), |s| s.job(run, &jobs));
+                                        out.fetch_sub(1, Ordering::Relaxed);
+                                        if res_tx.send(r).is_err() {
+                                            break;
+                                        }
+                                        if let Some(ctx) = &ctx {
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .expect("cannot start lighting thread");
+                    Worker { tx, outstanding }
+                })
+                .collect();
+            log::info!("lighting with {count} threads");
+            Some(Self { workers, results, synced: (u32::MAX, 0) })
+        }
+
         pub fn size(&self) -> usize {
-            0
+            self.workers.len()
         }
+
         pub fn synced(&self) -> (u32, u32) {
-            (0, 0)
+            self.synced
         }
+
         #[allow(clippy::too_many_arguments)]
         pub fn start_run(
             &mut self,
-            _: u32,
-            _: u32,
-            _: usize,
-            _: f64,
-            _: f64,
-            _: &[f32],
-            _: &LightParams,
+            run: u32,
+            version: u32,
+            n: usize,
+            res: f64,
+            sand_mm: f64,
+            hs: &[f32],
+            l: &LightParams,
         ) {
+            for w in &self.workers {
+                let (l, hs) = (l.clone(), hs.to_vec());
+                let _ = w.tx.send(Msg::Init { run, n, res, sand_mm, l, hs });
+            }
+            self.synced = (run, version);
         }
-        pub fn set_params(&mut self, _: u32, _: &LightParams) {}
-        pub fn update(&mut self, _: Rect, _: &[f32], _: usize) {}
+
+        pub fn set_params(&mut self, version: u32, l: &LightParams) {
+            for w in &self.workers {
+                let _ = w.tx.send(Msg::Params(l.clone()));
+            }
+            self.synced.1 = version;
+        }
+
+        /// Sends the changed region of the height field to all workers.
+        pub fn update(&mut self, r: Rect, hs: &[f32], n: usize) {
+            let mut rows = Vec::with_capacity((r.i1 - r.i0) * (r.j1 - r.j0));
+            for i in r.i0..r.i1 {
+                rows.extend_from_slice(&hs[i * n + r.j0..i * n + r.j1]);
+            }
+            for w in &self.workers {
+                let _ = w.tx.send(Msg::Hs(r, rows.clone()));
+            }
+        }
+
+        /// Workers that can take another job.
         pub fn free(&self) -> Vec<usize> {
-            Vec::new()
+            (0..self.workers.len())
+                .filter(|&k| self.workers[k].outstanding.load(Ordering::Relaxed) < MAX_OUTSTANDING)
+                .collect()
         }
-        pub fn send(&mut self, _: usize, _: u32, _: &[TileJob]) {}
+
+        pub fn send(&mut self, worker: usize, run: u32, jobs: &[TileJob]) {
+            let w = &self.workers[worker];
+            w.outstanding.fetch_add(1, Ordering::Relaxed);
+            let _ = w.tx.send(Msg::Job(run, jobs.to_vec()));
+        }
+
         pub fn take(&mut self) -> Vec<TileResult> {
-            Vec::new()
+            self.results.try_iter().flatten().collect()
         }
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    use super::{MAX_OUTSTANDING, TileJob, TileResult};
+    use super::{MAX_OUTSTANDING, TileJob, TileResult, worker_count};
     use crate::light::encode;
     use crate::params::LightParams;
     use crate::util::Rect;
@@ -121,10 +291,7 @@ mod imp {
         /// Starts one worker per spare core; None if that isn't possible.
         pub fn new(ctx: &egui::Context) -> Option<Self> {
             let cores = web_sys::window()?.navigator().hardware_concurrency() as usize;
-            let count = cores.saturating_sub(1).min(8);
-            if count < 2 {
-                return None;
-            }
+            let count = worker_count(cores)?;
             let results: Rc<RefCell<Vec<TileResult>>> = Default::default();
             let mut workers = Vec::new();
             for _ in 0..count {

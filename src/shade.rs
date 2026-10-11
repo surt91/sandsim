@@ -6,7 +6,7 @@
 
 use crate::light::{Grid, Kernel};
 use crate::params::{BG, LightParams, SAND_TINT, TONE, TONE_X};
-use crate::pool::{Pool, TileJob};
+use crate::pool::{MAX_OUTSTANDING, Pool, TileJob};
 use crate::sim::Sand;
 use crate::util::{Rect, noise_field};
 use egui::{Color32, ColorImage};
@@ -20,8 +20,9 @@ const FINE: u8 = 0;
 const ROUGH: u8 = 1;
 const INIT: u8 = 2; // never lit
 const DIRTY: u8 = 3;
-/// tiles per job sent to a web worker
-const JOB_TILES: usize = 2;
+/// tiles per job sent to a worker
+const MIN_JOB: usize = 2;
+const MAX_JOB: usize = 16;
 
 static RUNS: AtomicU32 = AtomicU32::new(0);
 
@@ -63,6 +64,8 @@ pub struct Shader {
     pub stats: (usize, f64),
     /// web workers in use
     pub workers: usize,
+    /// tiles received from the workers, not composed yet
+    received: Vec<usize>,
 }
 
 impl Shader {
@@ -98,6 +101,7 @@ impl Shader {
             last_full: None,
             sand_rgb: [0.6, 0.3, 0.2],
             workers: 0,
+            received: Vec::new(),
         };
         s.setup();
         s
@@ -236,49 +240,39 @@ impl Shader {
         });
         let mut order =
             todo.into_iter().map(|t| (t, !live)).chain(refine.into_iter().map(|t| (t, true)));
-        let mut done = Vec::new();
         self.stats = (0, 0.0);
+        let mut done = Vec::new();
         match pool {
             Some(pool) => {
                 self.workers = pool.size();
                 self.sync(pool, sand);
-                for r in pool.take() {
-                    if r.run != self.run {
-                        continue;
+                self.receive(Some(pool));
+                // spread the changed tiles evenly over the workers, so that they come back
+                // together; then fill up with refinement work
+                let urgent = (0..self.state.len())
+                    .filter(|&t| self.state[t] == DIRTY && !self.inflight[t])
+                    .count();
+                let chunk = urgent.div_ceil(pool.size()).clamp(MIN_JOB, MAX_JOB);
+                'dispatch: for _ in 0..MAX_OUTSTANDING {
+                    for k in pool.free() {
+                        let jobs: Vec<TileJob> = order
+                            .by_ref()
+                            .take(chunk)
+                            .map(|(t, fine)| {
+                                self.inflight[t] = true;
+                                TileJob {
+                                    tile: t,
+                                    rect: self.tile_rect(t),
+                                    fine,
+                                    generation: self.generation[t],
+                                }
+                            })
+                            .collect();
+                        if jobs.is_empty() {
+                            break 'dispatch;
+                        }
+                        pool.send(k, self.run, &jobs);
                     }
-                    let t = r.tile;
-                    self.inflight[t] = false;
-                    let w = r.rect.j1 - r.rect.j0;
-                    for i in r.rect.i0..r.rect.i1 {
-                        let (p, q) = (i * self.n + r.rect.j0, (i - r.rect.i0) * w);
-                        self.direct[p..p + w].copy_from_slice(&r.direct[q..q + w]);
-                        self.ambient[p..p + w].copy_from_slice(&r.ambient[q..q + w]);
-                    }
-                    // a result for an outdated tile is still shown, but the tile stays due
-                    if r.generation == self.generation[t] {
-                        self.state[t] = if r.fine { FINE } else { ROUGH };
-                    }
-                    self.stats.0 += 1;
-                    done.push(t);
-                }
-                for k in pool.free() {
-                    let jobs: Vec<TileJob> = order
-                        .by_ref()
-                        .take(JOB_TILES)
-                        .map(|(t, fine)| {
-                            self.inflight[t] = true;
-                            TileJob {
-                                tile: t,
-                                rect: self.tile_rect(t),
-                                fine,
-                                generation: self.generation[t],
-                            }
-                        })
-                        .collect();
-                    if jobs.is_empty() {
-                        break;
-                    }
-                    pool.send(k, self.run, &jobs);
                 }
             }
             None => {
@@ -304,6 +298,8 @@ impl Shader {
                 }
             }
         }
+        self.stats.0 += self.received.len();
+        done.append(&mut self.received);
         if done.is_empty() && !self.full_change {
             return;
         }
@@ -325,6 +321,29 @@ impl Shader {
                 self.compose(self.tile_rect(t), sand);
             }
             self.changed.extend(done);
+        }
+    }
+
+    /// Applies the tiles the workers have finished (they are shown with the next `work`).
+    pub fn receive(&mut self, pool: Option<&mut Pool>) {
+        let Some(pool) = pool else { return };
+        for r in pool.take() {
+            if r.run != self.run {
+                continue;
+            }
+            let t = r.tile;
+            self.inflight[t] = false;
+            let w = r.rect.j1 - r.rect.j0;
+            for i in r.rect.i0..r.rect.i1 {
+                let (p, q) = (i * self.n + r.rect.j0, (i - r.rect.i0) * w);
+                self.direct[p..p + w].copy_from_slice(&r.direct[q..q + w]);
+                self.ambient[p..p + w].copy_from_slice(&r.ambient[q..q + w]);
+            }
+            // a result for an outdated tile is still shown, but the tile stays due
+            if r.generation == self.generation[t] {
+                self.state[t] = if r.fine { FINE } else { ROUGH };
+            }
+            self.received.push(t);
         }
     }
 

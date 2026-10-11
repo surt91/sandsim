@@ -44,10 +44,11 @@ brightness curve and tint the sand (`SAND_TINT`) with the chosen colour – an a
 ## How it stays interactive
 
 The simulation runs on the main thread in time slices per frame; the lighting is spread over
-web workers (one per spare core, up to 8), which works on any static host such as GitHub Pages:
-each worker keeps a copy of the height field, gets the changed regions and lists of tiles to
-light, and sends back their light values. Without workers (single core, native window) the
-lighting also runs in time slices on the main thread.
+workers (one per spare core, up to 8): web workers in the browser, which works on any static
+host such as GitHub Pages, and threads in the native window. Both run the same code, only the
+transport differs (`postMessage` / channels): each worker keeps a copy of the height field,
+gets the changed regions and lists of tiles to light, and sends back their light values.
+With a single core the lighting runs in time slices on the main thread.
 
 - The simulation advances the ball in chunks of 16 steps and reports the changed region.
 - Lighting works on 32×32 px tiles. Tiles touched by the ball are re-lit first, closest to the
@@ -57,14 +58,27 @@ lighting also runs in time slices on the main thread.
   median of total light) is estimated from a fixed sample of pixels; the whole image is
   re-coloured with it at most once a second while work is pending. Exposure and colour
   settings only re-colour, they don't re-light.
-- Every tile has a generation counter that is bumped when the sand around it changes; a worker
-  result for an outdated generation is shown, but the tile stays due. The animation waits while
-  too many changed tiles are not lit yet, so the sand never shows where the ball has been.
+- The animation runs in waves: the ball moves on until a batch of tiles has changed, these are
+  spread evenly over the workers, and the ball only moves on once the whole wave is lit. So the
+  shown sand always belongs to one state of the simulation, and the ball is drawn where it was
+  in that state. Refinement work fills the workers in between. Every tile has a generation
+  counter that is bumped when the sand around it changes, so results that are outdated by the
+  time they arrive are recognised.
 - The horizon searches stop as soon as even the highest sand within reach could not change
   the result.
 
 A complete run of the zen garden example (177 000 steps of 0.5 mm) takes about 9 s of
-simulation and 5.5 s of lighting natively on one core; in the browser about 1.5–2× that.
+simulation natively; in the browser about 1.5–2× that. Lighting and animation speed with
+lighting threads (native, 8 cores / 16 threads; `SANDSIM_WORKERS=n cargo run --release --
+--bench pattern.thr` and `--bench-live`):
+
+| threads | full lighting (48 LEDs) | animation, as fast as possible |
+|---|---|---|
+| 0 (main thread) | 5.6 s | 0.25 m/s |
+| 2 | 3.0 s | 1.1 m/s |
+| 4 | 1.65 s | 2.0 m/s |
+| 8 | 1.05 s | 3.2 m/s |
+| 15 | 0.87 s | 3.5 m/s |
 
 ## License
 
