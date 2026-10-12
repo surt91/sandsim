@@ -35,7 +35,8 @@ benchmark that writes the top and oblique view as PNGs (`cargo run --release -- 
   and can be rotated around the table. It is rendered when the animation is paused or finished.
 - **Parameters**: lighting (LED colour, LED height, beam angle, shadows, ambient light, grain,
   exposure) applies immediately; sand and table parameters (angle of repose, sand depth,
-  ball size and lag, clearing spiral, table scale, grid) apply on *Apply & restart*.
+  ball size and lag, optional clearing spiral (off by default), table scale, grid) apply on
+  *Apply & restart*.
 - **Export**: save the current view as PNG.
 
 The orange LED light uses the tone curve calibrated against photos. Other LED colours keep its

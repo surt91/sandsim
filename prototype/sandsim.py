@@ -196,7 +196,7 @@ def _plow(h, mask, xs, ys, res, R, push_w, side, tans, tanr):
                min(cj + rw + 1, n), tans, tanr, cx, cy, R * R, R, res, 3)
 
 
-def simulate(tr, res=0.5, p=P, clear="auto", mirror=False, seed=1):
+def simulate(tr, res=0.5, p=P, clear="none", mirror=False, seed=1):
     n = int(2 * SAND_MM / res) + 1
     yy, xx = (np.mgrid[0:n, 0:n] * res - SAND_MM)
     mask = np.hypot(xx, yy) <= SAND_MM
@@ -476,7 +476,7 @@ def rotate_cam(cam, deg):
     return dict(cam, pos=(*(R @ p[:2]), p[2]), target=tuple(R @ np.array(cam["target"])))
 
 
-def render(thr, view="top", res=0.5, out_res=0.25, clear="auto", mirror=False,
+def render(thr, view="top", res=0.5, out_res=0.25, clear="none", mirror=False,
            cam_rot=0.0, p=P, l=L, cam=CAM):
     t = time.time()
     h, mask, ball = simulate(read_thr(thr), res, p, clear, mirror)
@@ -501,7 +501,7 @@ def main():
     ap.add_argument("--view", default="top", choices=["top", "oblique"])
     ap.add_argument("--res", type=float, default=0.5, help="simulation grid [mm/px]")
     ap.add_argument("--out-res", type=float, default=0.25, help="image resolution [mm/px]")
-    ap.add_argument("--clear", default="auto", choices=["auto", "in", "out", "none"],
+    ap.add_argument("--clear", default="none", choices=["auto", "in", "out", "none"],
                     help="clearing spiral before the pattern (auto: from outside if the pattern starts inside)")
     ap.add_argument("--mirror", action="store_true", help="mirror the theta direction")
     ap.add_argument("--cam-rot", type=float, default=0.0,

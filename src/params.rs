@@ -5,7 +5,6 @@ pub enum Clear {
     Auto,
     In,
     Out,
-    None,
 }
 
 /// Table geometry and sand model. Changing these requires a new simulation.
@@ -24,7 +23,8 @@ pub struct SimParams {
     pub clear_pitch: f64, // ring pitch of the clearing pattern [mm]
     pub step: f64,        // step size of the ball [mm]
     pub lag: f64,         // lag of the ball behind the magnet [mm] (rounds corners)
-    pub clear: Clear,
+    pub clear: bool,      // clearing spiral before the pattern
+    pub clear_dir: Clear,
     pub mirror: bool,
     pub seed: u64,
 }
@@ -45,7 +45,8 @@ impl Default for SimParams {
             clear_pitch: 6.1,
             step: 0.5,
             lag: 6.0,
-            clear: Clear::Auto,
+            clear: false,
+            clear_dir: Clear::Auto,
             mirror: false,
             seed: 1,
         }

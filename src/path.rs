@@ -66,14 +66,13 @@ fn towed(xy: &mut [[f64; 2]], lag: f64) {
 /// plus the number of steps that belong to the clearing spiral.
 pub fn ball_path(thr: &[[f64; 2]], p: &SimParams) -> (Vec<[f64; 2]>, usize) {
     let mut tr = Vec::new();
-    let clear = match p.clear {
-        Clear::Auto if thr[0][1] < 0.5 => Clear::Out,
-        Clear::Auto => Clear::In,
-        c => c,
-    };
     let mut n_clear = 0;
-    if matches!(clear, Clear::In | Clear::Out) {
-        let mut cp = clear_path(clear == Clear::Out, p.clear_pitch, p.rho_mm);
+    if p.clear {
+        let from_out = match p.clear_dir {
+            Clear::Auto => thr[0][1] < 0.5,
+            c => c == Clear::Out,
+        };
+        let mut cp = clear_path(from_out, p.clear_pitch, p.rho_mm);
         // continue seamlessly into the pattern start
         let off = thr[0][0] - cp.last().unwrap()[0];
         cp.iter_mut().for_each(|q| q[0] += off);

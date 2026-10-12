@@ -28,7 +28,7 @@ automatically. Options:
 | `--view top\|oblique` | top view or perspective view with grazing light |
 | `--res` | simulation grid in mm/px (default 0.5) |
 | `--out-res` | image resolution in mm/px (default 0.25) |
-| `--clear auto\|in\|out\|none` | clearing spiral before the pattern (default: auto) |
+| `--clear auto\|in\|out\|none` | clearing spiral before the pattern (default: none; auto: from outside if the pattern starts inside) |
 | `--mirror` | mirror the theta direction |
 | `--cam-rot` | rotate the oblique camera around the centre (degrees, counter-clockwise; default 0 = pose of the calibration photo) |
 

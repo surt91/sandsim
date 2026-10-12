@@ -525,15 +525,15 @@ impl SandApp {
         egui::CollapsingHeader::new("Sand & table").default_open(true).show(ui, |ui| {
             let p = &mut self.sim;
             ui.horizontal(|ui| {
-                ui.label("clearing");
-                for (c, name) in [
-                    (Clear::Auto, "auto"),
-                    (Clear::In, "in"),
-                    (Clear::Out, "out"),
-                    (Clear::None, "none"),
-                ] {
-                    ui.selectable_value(&mut p.clear, c, name);
-                }
+                ui.checkbox(&mut p.clear, "clearing spiral first")
+                    .on_hover_text("Off: the pattern starts on flat sand");
+                ui.add_enabled_ui(p.clear, |ui| {
+                    ui.selectable_value(&mut p.clear_dir, Clear::Auto, "auto").on_hover_text(
+                        "From outside if the pattern starts inside, else from inside",
+                    );
+                    ui.selectable_value(&mut p.clear_dir, Clear::In, "in");
+                    ui.selectable_value(&mut p.clear_dir, Clear::Out, "out");
+                });
             });
             ui.checkbox(&mut p.mirror, "mirror theta");
             ui.add(egui::Slider::new(&mut p.h0, 1.0..=10.0).text("sand depth [mm]"));
